@@ -9,15 +9,6 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# Constants
-OUTPUT_DIR = '/data/shared_hdd/netease'
-ENGLISH_IDS_FILE = os.path.join(OUTPUT_DIR, 'english_song_ids_800k.txt')
-PROCESSED_IDS_FILE = os.path.join(OUTPUT_DIR, 'processed_ids.txt')
-GOOD_LYRICS_IDS_FILE = os.path.join(OUTPUT_DIR, 'good_lyrics_ids.txt')
-LYRICS_DIR = os.path.join(OUTPUT_DIR, 'lyrics')
-SONGS_DIR = os.path.join(OUTPUT_DIR, 'songs')
-API_BASE_URL = 'http://localhost:3000'
-
 # Lyric processing settings
 MAX_WORKERS = 12
 MIN_LYRIC_LENGTH = 100
@@ -30,21 +21,9 @@ CHUNK_SIZE = 8192
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 
-# Add these constants
-BAD_LYRICS_IDS_FILE = os.path.join(OUTPUT_DIR, 'bad_lyrics_ids.txt')
-NO_URL_IDS_FILE = os.path.join(OUTPUT_DIR, 'no_url_ids.txt')
-
-# Add global tracking sets
-bad_lyrics_ids = set()
-no_url_ids = set()
-
-# Ensure directories exist
-os.makedirs(LYRICS_DIR, exist_ok=True)
-os.makedirs(SONGS_DIR, exist_ok=True)
-
-def get_song_lyric(song_id):
+def get_song_lyric(song_id, api_base_url):
     """Fetch the lyrics for a song."""
-    url = f"{API_BASE_URL}/lyric?id={song_id}"
+    url = f"{api_base_url}/lyric?id={song_id}"
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -105,13 +84,13 @@ def is_good_lyric(lyric_data):
     processed_lyrics = '\n'.join(f"{timestamp}{text}" for timestamp, text in ascii_segments)
     return True, processed_lyrics
 
-def get_song_url(song_id):
+def get_song_url(song_id, api_base_url, no_url_ids):
     """Fetch the download URL for a song."""
     # Skip if we already know this has no URL
     if song_id in no_url_ids:
         return None
         
-    url = f"{API_BASE_URL}/song/url?id={song_id}"
+    url = f"{api_base_url}/song/url?id={song_id}"
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -142,12 +121,12 @@ def get_song_url(song_id):
     
     return None
 
-def download_song(song_data):
+def download_song(song_data, songs_dir):
     """Download a song using its URL."""
     song_id = song_data['id']
     url = song_data['url']
     file_type = song_data.get('type', 'mp3')
-    song_path = os.path.join(SONGS_DIR, f"{song_id}.{file_type}")
+    song_path = os.path.join(songs_dir, f"{song_id}.{file_type}")
     
     # Skip if already downloaded
     if os.path.exists(song_path):
@@ -191,37 +170,40 @@ def download_song(song_data):
     print(f"Failed to download song {song_id} after {MAX_RETRIES} attempts")
     return None
 
-def save_bad_lyrics_ids():
+def save_bad_lyrics_ids(bad_lyrics_ids_file, bad_lyrics_ids):
     """Save the current set of bad lyrics IDs to file."""
-    with open(BAD_LYRICS_IDS_FILE, 'w') as f:
+    with open(bad_lyrics_ids_file, 'w') as f:
         for song_id in bad_lyrics_ids:
             f.write(f"{song_id}\n")
 
-def save_no_url_ids():
+def save_no_url_ids(no_url_ids_file, no_url_ids):
     """Save the current set of no URL IDs to file."""
-    with open(NO_URL_IDS_FILE, 'w') as f:
+    with open(no_url_ids_file, 'w') as f:
         for song_id in no_url_ids:
             f.write(f"{song_id}\n")
 
-def process_song(song_id):
+def process_song(song_id, args, bad_lyrics_ids, no_url_ids):
     """Process a single song: fetch lyrics, check quality, and download if good."""
-    # Check if we already know this has good lyrics
-    lyric_path = os.path.join(LYRICS_DIR, f"{song_id}.txt")
+    lyrics_dir = os.path.join(args.output_dir, 'lyrics')
+    songs_dir = os.path.join(args.output_dir, 'songs')
+    
+    # Check if we already have lyrics
+    lyric_path = os.path.join(lyrics_dir, f"{song_id}.txt")
     
     # If we already have lyrics, try to download the song
     if os.path.exists(lyric_path):
         # Check if song already exists
         song_exists = False
         for extension in ['mp3', 'm4a']:
-            if os.path.exists(os.path.join(SONGS_DIR, f"{song_id}.{extension}")):
+            if os.path.exists(os.path.join(songs_dir, f"{song_id}.{extension}")):
                 song_exists = True
                 break
         
         # Skip download if song exists or we know it has no URL
         if not song_exists and song_id not in no_url_ids:
-            song_data = get_song_url(song_id)
+            song_data = get_song_url(song_id, args.api_base_url, no_url_ids)
             if song_data:
-                download_song(song_data)
+                download_song(song_data, songs_dir)
         return True
     
     # Check if we already know this has bad lyrics
@@ -229,7 +211,7 @@ def process_song(song_id):
         return False
     
     # Fetch and process lyrics
-    lyric_data = get_song_lyric(song_id)
+    lyric_data = get_song_lyric(song_id, args.api_base_url)
     if lyric_data:
         is_good, processed_lyrics = is_good_lyric(lyric_data)
         if is_good and processed_lyrics:
@@ -239,9 +221,9 @@ def process_song(song_id):
             
             # Immediately try to download the song if not in no_url_ids
             if song_id not in no_url_ids:
-                song_data = get_song_url(song_id)
+                song_data = get_song_url(song_id, args.api_base_url, no_url_ids)
                 if song_data:
-                    download_song(song_data)
+                    download_song(song_data, songs_dir)
             return True
         else:
             # Mark as bad lyrics
@@ -251,39 +233,50 @@ def process_song(song_id):
     # If we couldn't determine (API error, etc.), don't mark as bad
     return False
 
-def combined_pipeline():
+def combined_pipeline(args):
     """Run the combined pipeline for lyrics and song downloads."""
-    if not os.path.exists(ENGLISH_IDS_FILE):
-        print(f"Error: English song IDs file {ENGLISH_IDS_FILE} not found.")
+    # Create output directories
+    lyrics_dir = os.path.join(args.output_dir, 'lyrics')
+    songs_dir = os.path.join(args.output_dir, 'songs')
+    os.makedirs(lyrics_dir, exist_ok=True)
+    os.makedirs(songs_dir, exist_ok=True)
+    
+    # Set up file paths
+    bad_lyrics_ids_file = os.path.join(args.output_dir, 'bad_lyrics_ids.txt')
+    no_url_ids_file = os.path.join(args.output_dir, 'no_url_ids.txt')
+    
+    if not os.path.exists(args.english_ids_file):
+        print(f"Error: English song IDs file {args.english_ids_file} not found.")
         return False
     
-    with open(ENGLISH_IDS_FILE, 'r') as f:
+    with open(args.english_ids_file, 'r') as f:
         all_song_ids = [line.strip() for line in f if line.strip()]
     
     print(f"Found {len(all_song_ids)} songs to process")
     
     # Load known bad lyrics IDs
-    global bad_lyrics_ids, no_url_ids
-    if os.path.exists(BAD_LYRICS_IDS_FILE):
-        with open(BAD_LYRICS_IDS_FILE, 'r') as f:
+    bad_lyrics_ids = set()
+    if os.path.exists(bad_lyrics_ids_file):
+        with open(bad_lyrics_ids_file, 'r') as f:
             bad_lyrics_ids = {line.strip() for line in f if line.strip()}
     
     # Load known no URL IDs
-    if os.path.exists(NO_URL_IDS_FILE):
-        with open(NO_URL_IDS_FILE, 'r') as f:
+    no_url_ids = set()
+    if os.path.exists(no_url_ids_file):
+        with open(no_url_ids_file, 'r') as f:
             no_url_ids = {line.strip() for line in f if line.strip()}
     
     print(f"Found {len(bad_lyrics_ids)} songs with known bad lyrics")
     print(f"Found {len(no_url_ids)} songs with known unavailable URLs")
     
     # Count existing good lyrics by scanning directory
-    existing_good_lyrics = {os.path.splitext(f)[0] for f in os.listdir(LYRICS_DIR) if f.endswith('.txt')}
+    existing_good_lyrics = {os.path.splitext(f)[0] for f in os.listdir(lyrics_dir) if f.endswith('.txt')}
     print(f"Found {len(existing_good_lyrics)} songs with good lyrics")
     
     # Get songs that have audio downloaded
     existing_audio = set()
     for extension in ['mp3', 'm4a']:
-        existing_audio.update(os.path.splitext(f)[0] for f in os.listdir(SONGS_DIR) if f.endswith(extension))
+        existing_audio.update(os.path.splitext(f)[0] for f in os.listdir(songs_dir) if f.endswith(extension))
     print(f"Found {len(existing_audio)} songs with audio downloaded")
     
     # A song is fully processed if it either:
@@ -303,7 +296,7 @@ def combined_pipeline():
     
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(process_song, song_id): song_id 
+            futures = {executor.submit(process_song, song_id, args, bad_lyrics_ids, no_url_ids): song_id 
                       for song_id in song_ids_to_process}
             
             with tqdm(total=total_to_process, desc="Processing songs") as pbar:
@@ -322,8 +315,8 @@ def combined_pipeline():
                         
                         # Periodically save IDs
                         if (failure_count + success_count) % 100 == 0:
-                            save_bad_lyrics_ids()
-                            save_no_url_ids()
+                            save_bad_lyrics_ids(bad_lyrics_ids_file, bad_lyrics_ids)
+                            save_no_url_ids(no_url_ids_file, no_url_ids)
                     except Exception as e:
                         print(f"Error processing song {song_id}: {e}")
     
@@ -331,33 +324,48 @@ def combined_pipeline():
         print("\nInterrupted. Saving progress...")
     finally:
         # Save the final lists
-        save_bad_lyrics_ids()
-        save_no_url_ids()
+        save_bad_lyrics_ids(bad_lyrics_ids_file, bad_lyrics_ids)
+        save_no_url_ids(no_url_ids_file, no_url_ids)
     
     # Final count of good lyrics and audio
-    final_good_lyrics = len([f for f in os.listdir(LYRICS_DIR) if f.endswith('.txt')])
-    final_good_audio = len([f for f in os.listdir(SONGS_DIR) if f.endswith(('.mp3', '.m4a'))])
+    final_good_lyrics = len([f for f in os.listdir(lyrics_dir) if f.endswith('.txt')])
+    final_good_audio = len([f for f in os.listdir(songs_dir) if f.endswith(('.mp3', '.m4a'))])
     
     print(f"\nResults:")
     print(f"- Found {final_good_lyrics} songs with good lyrics")
     print(f"- Found {final_good_audio} songs with audio downloaded")
     print(f"- Found {len(bad_lyrics_ids)} songs with bad lyrics")
     print(f"- Found {len(no_url_ids)} songs with unavailable URLs")
-    print(f"- All lyrics saved to {LYRICS_DIR}")
-    print(f"- All songs saved to {SONGS_DIR}")
-    print(f"- Bad lyrics IDs saved to {BAD_LYRICS_IDS_FILE}")
-    print(f"- No URL IDs saved to {NO_URL_IDS_FILE}")
+    print(f"- All lyrics saved to {lyrics_dir}")
+    print(f"- All songs saved to {songs_dir}")
+    print(f"- Bad lyrics IDs saved to {bad_lyrics_ids_file}")
+    print(f"- No URL IDs saved to {no_url_ids_file}")
     
     return True
 
 def main():
     parser = argparse.ArgumentParser(description='Fetch lyrics and download songs in parallel')
+    parser.add_argument('--output-dir', type=str, default='/data/shared_hdd/netease', 
+                        help='Directory to store all data')
+    parser.add_argument('--english-ids-file', type=str, 
+                        help='Path to file containing English song IDs')
+    parser.add_argument('--api-base-url', type=str, default='http://localhost:3000',
+                        help='Base URL for the API')
+    
     args = parser.parse_args()
     
+    # Set default english_ids_file if not provided
+    if not args.english_ids_file:
+        args.english_ids_file = os.path.join(args.output_dir, 'english_song_ids_800k.txt')
+    
     print("Starting combined lyrics and song download pipeline...")
+    print(f"Output directory: {args.output_dir}")
+    print(f"English IDs file: {args.english_ids_file}")
+    print(f"API base URL: {args.api_base_url}")
+    
     start_time = time.time()
     
-    success = combined_pipeline()
+    success = combined_pipeline(args)
     
     duration = time.time() - start_time
     print(f"\nCompleted in {duration:.2f} seconds")
