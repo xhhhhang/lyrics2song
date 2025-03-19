@@ -1,0 +1,3 @@
+[submodule "neteasecloudmusicapi"]
+	path = neteasecloudmusicapi
+	url = https://gitlab.com/982693y/neteasecloudmusicapi.git
